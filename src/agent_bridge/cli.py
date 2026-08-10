@@ -13,9 +13,12 @@ from typing import Any
 
 from .adapters import resolve_preset
 from .bridge import Bridge
+from .lifecycle import TeamLifecycle
 from .protocol import MAX_MESSAGE_CHARS, validate_body
+from .reports import load_report_file
 from .socket_transport import SocketTransportError, UnixSocketTransport
 from .store import Store, utc_now
+from .teams import load_manifest
 from .tmux import TmuxError, TmuxTransport
 
 
@@ -86,6 +89,11 @@ def cmd_register(args: argparse.Namespace) -> int:
         team=args.team,
         inbound_policy=args.inbound_policy,
         max_inbox=args.max_inbox,
+        role=args.role,
+        is_lead=args.lead,
+        readiness_required=args.readiness_required,
+        readiness_timeout=args.readiness_timeout,
+        restart_policy=args.restart_policy,
     )
     run = store.update_run(run.id, status="running")
     _print(
@@ -140,6 +148,11 @@ def cmd_start(args: argparse.Namespace) -> int:
         team=args.team,
         inbound_policy=args.inbound_policy,
         max_inbox=args.max_inbox,
+        role=args.role,
+        is_lead=args.lead,
+        readiness_required=args.readiness_required,
+        readiness_timeout=args.readiness_timeout,
+        restart_policy=args.restart_policy,
         log_path=str(log_dir / f"{uuid.uuid4().hex}.log"),
     )
     tmux = TmuxTransport(args.tmux)
@@ -398,13 +411,15 @@ def cmd_task_create(args: argparse.Namespace) -> int:
         created_by=_task_created_by(store, args.from_run),
         assigned_to=store.get_run(args.assign).id if args.assign else None,
         depends_on=depends_on,
+        requires_approval=args.requires_approval,
+        status=args.status,
     )
     _print(task, args.json)
     return 0
 
 
 def cmd_task_list(args: argparse.Namespace) -> int:
-    tasks = _store(args).list_tasks(args.status)
+    tasks = _store(args).list_tasks(args.status, team=args.team)
     _print(tasks, args.json)
     return 0
 
@@ -423,8 +438,193 @@ def cmd_task_claim(args: argparse.Namespace) -> int:
 
 def cmd_task_complete(args: argparse.Namespace) -> int:
     store = _store(args)
-    task = store.complete_task(args.task_id, _source_run(store, args.run))
+    report = load_report_file(args.summary_file) if args.summary_file else None
+    task = store.complete_task(args.task_id, _source_run(store, args.run), report=report)
     _print(task, args.json)
+    return 0
+
+
+def cmd_task_fail(args: argparse.Namespace) -> int:
+    store = _store(args)
+    report = load_report_file(args.summary_file) if args.summary_file else None
+    task = store.fail_task(args.task_id, _source_run(store, args.run), report=report)
+    _print(task, args.json)
+    return 0
+
+
+def cmd_adapter(args: argparse.Namespace) -> int:
+    """Run the disposable generic readiness-aware adapter sidecar.
+
+    It serves only structured JSON frames and prints bounded messages. It does
+    not attempt to drive a provider REPL or interpret peer text as commands.
+    """
+    store = _store(args)
+    run = store.get_run(args.run)
+    bridge = Bridge(store)
+    session_id = args.session or uuid.uuid4().hex
+    received: list[dict[str, object]] = []
+    listener_error: list[BaseException] = []
+
+    def on_message(payload: dict[str, object]) -> None:
+        from .protocol import validate_message_frame
+        frame = validate_message_frame(payload, recipient_id=run.id)
+        received.append(frame)
+        _print(frame, args.json)
+        sys.stdout.flush()
+
+    def serve() -> None:
+        try:
+            UnixSocketTransport().listen(
+                path=run.inbox_path or "", on_message=on_message,
+                once=args.once, timeout=args.timeout,
+            )
+        except BaseException as exc:
+            listener_error.append(exc)
+
+    thread = __import__("threading").Thread(target=serve, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + (args.timeout or 5.0)
+    while not Path(run.inbox_path or "").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not Path(run.inbox_path or "").exists():
+        raise ValueError("adapter could not publish its inbox socket")
+    bridge.handle_adapter_frame({
+        "type": "hello", "run_id": run.id, "session_id": session_id,
+        "capabilities": args.capability,
+    })
+    bridge.handle_adapter_frame({
+        "type": "ready", "run_id": run.id, "session_id": session_id,
+        "capabilities": args.capability,
+    })
+    thread.join(timeout=args.timeout)
+    if thread.is_alive():
+        store.adapter_event({"type": "heartbeat", "run_id": run.id, "session_id": session_id})
+    if listener_error:
+        raise ValueError(str(listener_error[0]))
+    return 0
+
+
+def cmd_team_create(args: argparse.Namespace) -> int:
+    store = _store(args)
+    lifecycle = TeamLifecycle(store, TmuxTransport(args.tmux))
+    if args.manifest:
+        team = lifecycle.create_from_manifest(load_manifest(Path(args.manifest).expanduser()))
+    else:
+        if not args.name:
+            raise ValueError("provide --name or --manifest")
+        metadata = json.loads(args.metadata) if args.metadata else {}
+        team = store.create_team(name=args.name, metadata=metadata)
+    result = {"team": team, "members": store.list_team_members(team.id)}
+    _print(result, args.json)
+    return 0
+
+
+def cmd_team_list(args: argparse.Namespace) -> int:
+    _print(_store(args).list_teams(args.limit), args.json)
+    return 0
+
+
+def cmd_team_show(args: argparse.Namespace) -> int:
+    store = _store(args)
+    team = store.get_team(args.team)
+    _print({"team": team, "members": store.list_team_members(team.id, active_only=not args.all)}, args.json)
+    return 0
+
+
+def cmd_team_member_add(args: argparse.Namespace) -> int:
+    store = _store(args)
+    member = store.add_team_member(args.team, args.run, role=args.role, is_lead=args.lead)
+    _print(member, args.json)
+    return 0
+
+
+def cmd_team_member_remove(args: argparse.Namespace) -> int:
+    member = _store(args).remove_team_member(args.team, args.run)
+    _print(member, args.json)
+    return 0
+
+
+def cmd_team_lifecycle(args: argparse.Namespace) -> int:
+    store = _store(args)
+    lifecycle = TeamLifecycle(store, TmuxTransport(args.tmux))
+    if args.team_command == "start": result = lifecycle.start(args.team, wait=not args.no_wait)
+    elif args.team_command == "stop": result = lifecycle.stop(args.team)
+    elif args.team_command == "restart": result = lifecycle.restart(args.team)
+    elif args.team_command == "watch": result = lifecycle.watch(args.team, interval=args.interval, iterations=args.iterations)
+    else: result = lifecycle.status(args.team)
+    _print(result, args.json)
+    return 0
+
+
+def cmd_task_submit(args: argparse.Namespace) -> int:
+    store = _store(args)
+    task = store.submit_task(args.task_id, _source_run(store, args.run))
+    _print(task, args.json)
+    return 0
+
+
+def cmd_task_approve(args: argparse.Namespace) -> int:
+    store = _store(args)
+    task = store.approve_task(args.task_id, _source_run(store, args.run))
+    _print(task, args.json)
+    return 0
+
+
+def cmd_task_reject(args: argparse.Namespace) -> int:
+    store = _store(args)
+    task = store.reject_task(args.task_id, _source_run(store, args.run), args.reason)
+    _print(task, args.json)
+    return 0
+
+
+def cmd_task_block(args: argparse.Namespace) -> int:
+    store = _store(args)
+    task = store.block_task(args.task_id, _source_run(store, args.run), args.reason)
+    _print(task, args.json)
+    return 0
+
+
+def cmd_task_report(args: argparse.Namespace) -> int:
+    store = _store(args)
+    report = load_report_file(args.summary_file)
+    saved = store.add_task_report(args.task_id, _source_run(store, args.run), report)
+    _print(saved, args.json)
+    return 0
+
+
+def cmd_task_reports(args: argparse.Namespace) -> int:
+    _print(_store(args).get_task_reports(args.task_id), args.json)
+    return 0
+
+
+def cmd_hook_add(args: argparse.Namespace) -> int:
+    command = json.loads(args.command_json)
+    hook = _store(args).add_hook(name=args.name, event=args.event, command=command, timeout=args.timeout, max_output=args.max_output, fail_closed=args.fail_closed)
+    _print(hook, args.json)
+    return 0
+
+
+def cmd_hook_list(args: argparse.Namespace) -> int:
+    _print(_store(args).list_hooks(args.event), args.json)
+    return 0
+
+
+def cmd_hook_events(args: argparse.Namespace) -> int:
+    _print(_store(args).list_hook_events(args.limit), args.json)
+    return 0
+
+
+def cmd_operator(args: argparse.Namespace) -> int:
+    store = _store(args)
+    if args.operator_command == "grant": result = store.grant_operator(args.run)
+    elif args.operator_command == "revoke": store.revoke_operator(args.run); result = {"run": args.run, "status": "revoked"}
+    else: result = [{"run_id": run.id, "name": run.name} for run in store.list_runs(limit=10_000) if store.is_operator(run.id)]
+    _print(result, args.json)
+    return 0
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    _print(_store(args).list_audit(args.limit), args.json)
     return 0
 
 
@@ -466,6 +666,11 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--team")
     register.add_argument("--inbound-policy", choices=["accept", "hold", "refuse"], default="accept")
     register.add_argument("--max-inbox", type=int, default=100)
+    register.add_argument("--role", default="member")
+    register.add_argument("--lead", action="store_true")
+    register.add_argument("--readiness-required", action="store_true")
+    register.add_argument("--readiness-timeout", type=float, default=0)
+    register.add_argument("--restart-policy", choices=["never", "on-failure", "always"], default="never")
     register.set_defaults(func=cmd_register)
 
     heartbeat = sub.add_parser("heartbeat", help="update a run's liveness timestamp")
@@ -483,6 +688,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--team", help="local team label")
     start.add_argument("--inbound-policy", choices=["accept", "hold", "refuse"], default="accept")
     start.add_argument("--max-inbox", type=int, default=100)
+    start.add_argument("--role", default="member")
+    start.add_argument("--lead", action="store_true")
+    start.add_argument("--readiness-required", action="store_true")
+    start.add_argument("--readiness-timeout", type=float, default=0)
+    start.add_argument("--restart-policy", choices=["never", "on-failure", "always"], default="never")
     start.add_argument("--tmux", default="tmux")
     start.add_argument("--initial-message")
     start.add_argument("--ready-delay", type=float, default=1.0)
@@ -573,9 +783,12 @@ def build_parser() -> argparse.ArgumentParser:
     task_create.add_argument("--from", dest="from_run")
     task_create.add_argument("--assign")
     task_create.add_argument("--depends-on", action="append", default=[])
+    task_create.add_argument("--requires-approval", action="store_true")
+    task_create.add_argument("--status", choices=["proposed", "awaiting_approval", "pending"])
     task_create.set_defaults(func=cmd_task_create)
     task_list = task_sub.add_parser("list")
     task_list.add_argument("--status")
+    task_list.add_argument("--team")
     task_list.set_defaults(func=cmd_task_list)
     task_show = task_sub.add_parser("show")
     task_show.add_argument("task_id")
@@ -587,7 +800,115 @@ def build_parser() -> argparse.ArgumentParser:
     task_complete = task_sub.add_parser("complete")
     task_complete.add_argument("task_id")
     _add_run_ref(task_complete)
+    task_complete.add_argument("--summary-file")
     task_complete.set_defaults(func=cmd_task_complete)
+    task_fail = task_sub.add_parser("fail")
+    task_fail.add_argument("task_id")
+    _add_run_ref(task_fail)
+    task_fail.add_argument("--summary-file")
+    task_fail.set_defaults(func=cmd_task_fail)
+    task_submit = task_sub.add_parser("submit")
+    task_submit.add_argument("task_id")
+    _add_run_ref(task_submit)
+    task_submit.set_defaults(func=cmd_task_submit)
+    task_approve = task_sub.add_parser("approve")
+    task_approve.add_argument("task_id")
+    _add_run_ref(task_approve)
+    task_approve.set_defaults(func=cmd_task_approve)
+    task_reject = task_sub.add_parser("reject")
+    task_reject.add_argument("task_id")
+    _add_run_ref(task_reject)
+    task_reject.add_argument("--reason", default="")
+    task_reject.set_defaults(func=cmd_task_reject)
+    task_block = task_sub.add_parser("block")
+    task_block.add_argument("task_id")
+    _add_run_ref(task_block)
+    task_block.add_argument("--reason", default="")
+    task_block.set_defaults(func=cmd_task_block)
+    task_report = task_sub.add_parser("report")
+    task_report.add_argument("task_id")
+    _add_run_ref(task_report)
+    task_report.add_argument("--summary-file", required=True)
+    task_report.set_defaults(func=cmd_task_report)
+    task_reports = task_sub.add_parser("reports")
+    task_reports.add_argument("task_id")
+    task_reports.set_defaults(func=cmd_task_reports)
+
+    adapter = sub.add_parser("adapter", aliases=["sidecar"], help="run the generic readiness-aware local adapter")
+    adapter.add_argument("run")
+    adapter.add_argument("--session")
+    adapter.add_argument("--capability", action="append", default=[])
+    adapter.add_argument("--once", action="store_true")
+    adapter.add_argument("--timeout", type=float, default=5.0)
+    adapter.set_defaults(func=cmd_adapter)
+
+    team = sub.add_parser("team", help="manage durable teams and their members")
+    team_sub = team.add_subparsers(dest="team_command", required=True)
+    team_create = team_sub.add_parser("create")
+    team_create.add_argument("--name")
+    team_create.add_argument("--manifest")
+    team_create.add_argument("--metadata")
+    team_create.add_argument("--tmux", default="tmux")
+    team_create.set_defaults(func=cmd_team_create)
+    team_list = team_sub.add_parser("list")
+    team_list.add_argument("--limit", type=int, default=50)
+    team_list.set_defaults(func=cmd_team_list)
+    team_show = team_sub.add_parser("show")
+    team_show.add_argument("team")
+    team_show.add_argument("--all", action="store_true")
+    team_show.set_defaults(func=cmd_team_show)
+    member = team_sub.add_parser("member")
+    member_sub = member.add_subparsers(dest="member_command", required=True)
+    member_add = member_sub.add_parser("add")
+    member_add.add_argument("team")
+    member_add.add_argument("run")
+    member_add.add_argument("--role", default="member")
+    member_add.add_argument("--lead", action="store_true")
+    member_add.set_defaults(func=cmd_team_member_add)
+    member_remove = member_sub.add_parser("remove")
+    member_remove.add_argument("team")
+    member_remove.add_argument("run")
+    member_remove.set_defaults(func=cmd_team_member_remove)
+    for lifecycle_name in ("start", "stop", "restart", "status", "watch"):
+        lifecycle = team_sub.add_parser(lifecycle_name)
+        lifecycle.add_argument("team")
+        lifecycle.add_argument("--tmux", default="tmux")
+        lifecycle.add_argument("--no-wait", action="store_true")
+        lifecycle.add_argument("--interval", type=float, default=1.0)
+        lifecycle.add_argument("--iterations", type=int, default=1)
+        lifecycle.set_defaults(func=cmd_team_lifecycle)
+
+    hook = sub.add_parser("hook", help="manage bounded local event hooks")
+    hook_sub = hook.add_subparsers(dest="hook_command", required=True)
+    hook_add = hook_sub.add_parser("add")
+    hook_add.add_argument("--name", required=True)
+    hook_add.add_argument("--event", required=True)
+    hook_add.add_argument("--command-json", required=True, help="JSON array of argv strings")
+    hook_add.add_argument("--timeout", type=float, default=5.0)
+    hook_add.add_argument("--max-output", type=int, default=8192)
+    hook_add.add_argument("--fail-closed", action="store_true")
+    hook_add.set_defaults(func=cmd_hook_add)
+    hook_list = hook_sub.add_parser("list")
+    hook_list.add_argument("--event")
+    hook_list.set_defaults(func=cmd_hook_list)
+    hook_events = hook_sub.add_parser("events")
+    hook_events.add_argument("--limit", type=int, default=100)
+    hook_events.set_defaults(func=cmd_hook_events)
+
+    operator = sub.add_parser("operator", help="grant or revoke local governance operators")
+    operator_sub = operator.add_subparsers(dest="operator_command", required=True)
+    operator_grant = operator_sub.add_parser("grant")
+    operator_grant.add_argument("run")
+    operator_grant.set_defaults(func=cmd_operator)
+    operator_revoke = operator_sub.add_parser("revoke")
+    operator_revoke.add_argument("run")
+    operator_revoke.set_defaults(func=cmd_operator)
+    operator_list = operator_sub.add_parser("list")
+    operator_list.set_defaults(func=cmd_operator)
+
+    audit = sub.add_parser("audit", help="show durable governance and lifecycle audit entries")
+    audit.add_argument("--limit", type=int, default=100)
+    audit.set_defaults(func=cmd_audit)
 
     seen_parsers: set[int] = set()
     for child in sub.choices.values():
@@ -603,6 +924,12 @@ def build_parser() -> argparse.ArgumentParser:
         seen_task_parsers.add(id(child))
         child.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path")
         child.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="emit machine-readable JSON")
+    for group in (team_sub, member_sub, hook_sub, operator_sub):
+        for child in group.choices.values():
+            if id(child) in seen_parsers or id(child) in seen_task_parsers:
+                continue
+            child.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path")
+            child.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="emit machine-readable JSON")
 
     return parser
 

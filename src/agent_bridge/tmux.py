@@ -111,10 +111,16 @@ class TmuxTransport:
         if submitted.returncode != 0:
             raise TmuxError(submitted.stderr.strip() or "tmux could not submit the message")
 
-    def stop(self, session: str) -> None:
-        subprocess.run(
-            [self.binary, "kill-session", "-t", session],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+    def stop(self, session: str, *, timeout: float = 5.0) -> None:
+        try:
+            subprocess.run(
+                [self.binary, "kill-session", "-t", session],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # Lifecycle callers record the bounded stop attempt; a hung tmux
+            # command must not hold the bridge indefinitely.
+            return

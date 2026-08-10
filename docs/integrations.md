@@ -113,6 +113,42 @@ agent-bridge start \
 These are convenience presets only. There are no provider-native integrations
 in this package.
 
+## Readiness-aware generic sidecar
+
+For a provider-neutral disposable adapter smoke test, register a readiness
+required run and serve its socket with:
+
+```bash
+agent-bridge adapter worker --once --json
+```
+
+The sidecar records hello, capabilities, ready, and heartbeat state and
+accepts one structured message. It deliberately does not call a Pi, Claude,
+Codex, Hermes, or other provider API. A real adapter can use the same bounded
+JSON-lines message frame and call `ack` only after its own consumer verifies
+the handoff. Busy/idle and heartbeat/error/shutdown control frames are
+persisted through the adapter protocol.
+
+## Teams, hooks, and reports
+
+Team manifests are bounded JSON and use only standard-library parsing. They
+may specify member name, agent, command, cwd, role, `lead`, readiness timeout,
+and restart policy. `team start` waits for required readiness; `team status`
+keeps offline members visible. Directly launched manifest members are owned by
+persisted PID/start-token identity, while externally registered processes are
+never killed by cleanup.
+
+Approval is a durable task transition, not a message convention. Grant an
+operator with `operator grant`, or designate one active team lead. Peer text
+cannot approve a task. Local hooks receive bounded JSON on stdin through an
+argv array (`shell=False`), with capped output and timeout; approval and
+rejection hooks fail closed and all outcomes are recorded.
+
+Completion summaries use the bounded fields `goal`, `verified_facts`, `tests`,
+`files_changed`, `blockers`, and `next_action`. `task complete --summary-file`
+reads no more than 32 KiB, and `task reports` retrieves stored reports for
+completed, failed, or rejected work.
+
 ## Handoff format
 
 Keep handoffs concise and evidence-led:

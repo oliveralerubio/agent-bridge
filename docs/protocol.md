@@ -144,8 +144,9 @@ optional tmux envelope.
 
 ## Tasks
 
-Tasks are durable, local shared work items with `pending`, `in_progress`,
-`completed`, `failed`, or `cancelled` status. A task may name existing parent
+Tasks are durable, local shared work items with `proposed`,
+`awaiting_approval`, `approved`, `pending`, `in_progress`, `completed`,
+`rejected`, `blocked`, `failed`, or `cancelled` status. A task may name existing parent
 tasks as dependencies. Claims are serialized with `BEGIN IMMEDIATE`, require
 all dependencies to be completed, and honor an existing assignee. Only the run
 that claimed an in-progress task can complete it.
@@ -156,6 +157,68 @@ agent-bridge task list --json
 agent-bridge task claim <task-id> --run worker
 agent-bridge task complete <task-id> --run worker
 ```
+
+## Readiness-aware adapter frames
+
+The socket remains a bounded JSON-lines transport. In addition to the legacy
+`agent-bridge.message` envelope, the protocol normalizes these frame types:
+`hello`, `ready`, `busy`, `idle`, `heartbeat`, `message`, `ack`, `shutdown`,
+and `error`. Control frames carry a bounded `run_id`; all session-bound frames
+also carry a bounded `session_id`. Hello/ready may advertise at most 32 unique
+capabilities of at most 64 characters each. Adapter errors and reasons are
+capped at 1,000 characters, and the complete encoded frame is capped by
+`MAX_SOCKET_FRAME_BYTES`.
+
+A hello creates the persisted adapter session and heartbeat; ready or idle
+makes a readiness-aware run deliverable. Busy, offline, stopping, failed, and
+expired-heartbeat runs do not receive automatic delivery. Heartbeats expire
+after 30 seconds by default and a subsequent heartbeat/ready recovers the
+session. Adapter acknowledgements are still recipient-only semantic
+acknowledgements; transport `{"ok":true}` only means that the local adapter
+accepted the frame.
+
+## Teams and lifecycle
+
+`teams` and `team_members` are durable tables. Team names are unique, the
+team/run IDs are stable, and each membership exposes the stable derived ID
+`member-<team-id>-<run-id>`. A run has at most one active team membership,
+and a team has at most one active lead. The JSON manifest is deliberately
+standard-library-only and bounded to 128 KiB/64 members. It supports member
+name, agent label, command, cwd, role, lead, readiness timeout, readiness
+requirement, restart policy, mode, and optional inbox.
+
+Lifecycle commands are `team create/list/show`, `team member add/remove`, and
+`team start/stop/restart/status/watch`. A manifest member with no tmux session
+is launched directly with an argv array (`shell=False`) and a private process
+group. Its PID and process-start token are persisted and checked before stop;
+external runs without ownership are shown as offline and are not killed.
+Restart reuses the same durable run and membership rows. Startup waits up to
+the member readiness timeout when readiness is required; offline members stay
+visible in team status.
+
+## Governance, hooks, and completion reports
+
+Tasks support `proposed`, `awaiting_approval`, `approved`, `pending`,
+`in_progress`, `completed`, `rejected`, `blocked`, `failed`, and `cancelled`.
+Dependencies are checked inside the atomic claim transaction. A task requiring
+approval cannot be claimed until approved. Approval and rejection require a
+grant in `operators` or an explicit team lead; ungrouped tasks therefore require
+an operator grant, and peer-message text is never interpreted as authorization.
+
+Hooks are configured as bounded argv arrays. Their JSON stdin is capped at 16
+KiB, their output is capped per hook, and execution has a timeout. Hook
+failures and outputs are stored in `hook_events`; lifecycle, message, task,
+adapter, and delivery events also create audit entries. Approval and rejection
+hooks are fail-closed regardless of the hook's optional-event policy; ordinary
+notification hooks do not roll back the core operation. Shell syntax is never
+applied to message bodies.
+
+A completion report is a bounded JSON object with string `goal` and
+`next_action`, plus string-list `verified_facts`, `tests`, `files_changed`, and
+`blockers`. Control characters, wrong types, unknown fields, more than 64 list
+items, and reports over 32 KiB are rejected. `task complete --summary-file`
+reads at most 32 KiB before parsing; reports remain retrievable after reopen
+and may be attached to failed or rejected tasks.
 
 ## Legacy SQLite migration
 

@@ -216,6 +216,80 @@ Do not put credentials, tokens, private transcripts, or unbounded command output
 
 This is intentionally an agent-neutral protocol, not an Anthropic API clone. Provider-specific native tool plugins can call the same CLI and SQLite protocol without changing the data model.
 
+## Readiness-aware adapters
+
+The local Unix-socket contract accepts bounded JSON-lines frames for `hello`,
+`ready`, `busy`, `idle`, `heartbeat`, `message`, `ack`, `shutdown`, and
+`error`. Adapter sessions, readiness, capabilities, heartbeat timestamps, and
+failures are persisted in SQLite. A run marked readiness-aware is gated until
+that session reports `ready` or `idle`; legacy runs keep the 0.2.0 socket-first
+then tmux fallback behavior.
+
+The generic sidecar is intentionally not a provider integration:
+
+```bash
+agent-bridge adapter <run-name> --once --json
+```
+
+It performs a local hello/ready handshake and accepts one bounded message. It
+only prints structured data; it does not drive a Pi, Claude, or other provider
+REPL. Heartbeats expire after 30 seconds unless refreshed.
+
+## Teams and lifecycle
+
+Teams and membership are durable SQLite entities. Names are unique, members
+have stable derived membership IDs (`member-<team-id>-<run-id>`), run IDs, and
+roles, and at most one active member is a lead. A JSON
+manifest (read with a bounded 128 KiB limit) can define `name`, `agent`,
+`command`, `cwd`, `role`, `lead`, `readiness_timeout`/`startup_timeout`, and
+`restart_policy` (`never`, `on-failure`, or `always`):
+
+```bash
+agent-bridge team create --manifest team.json --json
+agent-bridge team start <team> --json
+agent-bridge team status <team> --json
+agent-bridge team restart <team> --json
+agent-bridge team stop <team> --json
+```
+
+Use `team list`, `team show`, and `team member add/remove` for inspection and
+membership changes. Manifest members without a tmux session are launched as
+bounded, shell-free child processes with persisted PID identity; externally
+registered runs are reported offline and are never guessed at or killed.
+Restart reuses the durable run and membership IDs, preserving message/task
+history.
+
+## Approval, hooks, and reports
+
+Tasks may be `proposed`, `awaiting_approval`, `approved`, `pending`,
+`in_progress`, `completed`, `rejected`, `blocked`, `failed`, or `cancelled`.
+Approval is available only to a granted local operator or an explicit team lead;
+ungrouped tasks therefore require an operator grant, and peer message text is
+never approval.
+A gated task cannot be claimed before approval.
+
+Hooks are explicit local argv arrays, never shell strings. Hook input is bounded
+JSON (16 KiB), output is capped, subprocesses have a timeout, and failures are
+recorded in SQLite. Approval/rejection gates fail closed:
+
+```bash
+agent-bridge hook add --name audit --event task.approved \
+  --command-json '["/usr/bin/logger","agent-bridge approval"]' --fail-closed
+agent-bridge hook events --json
+agent-bridge audit --json
+```
+
+Completion summaries contain bounded `goal`, `verified_facts`, `tests`,
+`files_changed`, `blockers`, and `next_action` fields. A summary file is read
+at most 32 KiB before JSON parsing:
+
+```bash
+agent-bridge task complete <task> --run worker --summary-file summary.json --json
+agent-bridge task reports <task> --json
+```
+Reports can also be attached to failed or rejected tasks. No message body,
+transcript, credential, or file content is implicitly transferred.
+
 ## Development
 
 ```bash

@@ -30,6 +30,13 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(args.from_run, "sender")
         self.assertEqual(args.to, "receiver")
 
+    def test_extended_commands_accept_json_after_leaf(self) -> None:
+        team = build_parser().parse_args(["team", "status", "reviewers", "--json"])
+        self.assertTrue(team.json)
+        report = build_parser().parse_args(["task", "complete", "task-1", "--run", "worker", "--summary-file", "summary.json", "--json"])
+        self.assertEqual(report.summary_file, "summary.json")
+        self.assertTrue(report.json)
+
 
 if __name__ == "__main__":
     unittest.main()
