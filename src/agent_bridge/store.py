@@ -190,6 +190,43 @@ CREATE TABLE IF NOT EXISTS adapter_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS executions (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'timeout', 'partial')),
+    manifest_sha256 TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    checkpoint_path TEXT NOT NULL,
+    current_phase INTEGER,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS execution_phases (
+    execution_id TEXT NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES runs(id),
+    phase_index INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    command_json TEXT NOT NULL,
+    cwd TEXT,
+    timeout_seconds REAL NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'timeout', 'partial')),
+    started_at TEXT,
+    ended_at TEXT,
+    exit_code INTEGER,
+    agent_end INTEGER NOT NULL DEFAULT 0 CHECK (agent_end IN (0, 1)),
+    output TEXT NOT NULL DEFAULT '',
+    error TEXT,
+    PRIMARY KEY (execution_id, phase_index),
+    UNIQUE (execution_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_execution_phases_status ON execution_phases(execution_id, status, phase_index);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency_sender
     ON messages(from_run_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(to_run_id, status, created_at);
@@ -282,7 +319,7 @@ class Store:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             self._migrate_legacy(connection)
-            connection.execute("PRAGMA user_version = 4")
+            connection.execute("PRAGMA user_version = 5")
 
     def _migrate_legacy(self, connection: sqlite3.Connection) -> None:
         run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
@@ -333,6 +370,9 @@ class Store:
                 SELECT id, title, description, created_by, assigned_to, status, depends_on, created_at, updated_at, completed_at FROM tasks_v1"""
             )
             connection.execute("DROP TABLE tasks_v1")
+        phase_columns = {row[1] for row in connection.execute("PRAGMA table_info(execution_phases)")}
+        if phase_columns and "run_id" not in phase_columns:
+            connection.execute("ALTER TABLE execution_phases ADD COLUMN run_id TEXT REFERENCES runs(id)")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency_sender ON messages(from_run_id, idempotency_key) WHERE idempotency_key IS NOT NULL")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_status ON messages(to_run_id, status, created_at)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(from_run_id, created_at)")
@@ -417,6 +457,41 @@ class Store:
         query += " ORDER BY started_at DESC LIMIT ?"; params.append(limit)
         with self.connect() as connection: rows = connection.execute(query, params).fetchall()
         return [Run.from_row(row) for row in rows]
+
+    # ---------- supervised executions ----------
+    def get_execution(self, reference: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM executions WHERE id = ? OR name = ? LIMIT 1",
+                (reference, reference),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"execution not found: {reference}")
+        return dict(row)
+
+    def list_executions(self, limit: int = 50, *, status: str | None = None) -> list[dict[str, Any]]:
+        valid = {"pending", "running", "done", "failed", "timeout", "partial"}
+        if status is not None and status not in valid:
+            raise ValueError(f"invalid execution status: {status}")
+        query = "SELECT * FROM executions"
+        params: list[Any] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_execution_phases(self, execution_reference: str) -> list[dict[str, Any]]:
+        execution = self.get_execution(execution_reference)
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM execution_phases WHERE execution_id = ? ORDER BY phase_index",
+                (execution["id"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def update_run(self, run_id: str, *, status: str, ended_at: str | None = None,
                    lifecycle_state: str | None = None, failure_reason: str | None = None,
