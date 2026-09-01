@@ -234,6 +234,39 @@ partial unique index;
 The migration is local and uses SQLite's transaction handling. Existing message
 IDs and bodies remain unchanged.
 
+## Supervised execution contract
+
+Coordination and process supervision are separate but share the same SQLite
+store. The `run` command is the generic, provider-neutral supervisor for a
+bounded sequential manifest. It accepts explicit argv arrays only, launches
+each phase with `shell=False` and a private process group, and exports the
+execution and phase identity to the child environment. There is one writer
+role maximum and phases never run concurrently.
+
+Each phase must emit:
+
+```text
+AGENT_BRIDGE_AGENT_END phase=<phase-name> status=success
+```
+
+alongside a zero exit code to be `done`. A zero exit code without the terminal
+agent evidence is `partial`; a non-zero exit is `failed`; and a process-group
+timeout is `timeout`. These outcomes are never collapsed into a generic
+success state. The supervisor persists phase records, a manifest digest, and
+an atomic JSON checkpoint. Resume is allowed only with the same manifest
+digest and skips only phases already proven `done`.
+
+`execution stop <name-or-id>` is the operator control for an active phase. It
+uses the persisted process identity and process group, records a controlled
+failure, and writes a new checkpoint. It never reports a stopped execution as
+successful.
+
+The core can verify lifecycle evidence, exit status, output bounds, and local
+checkpoints. It cannot infer a provider's effective model, internal
+subagents, or semantic code correctness. A provider adapter must emit and
+record those facts explicitly, and an independent verifier remains required
+for accepting a code change.
+
 ## Integration contract
 
 An integration should:

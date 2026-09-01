@@ -32,6 +32,80 @@ agent-bridge doctor
 
 The default database is `~/.agent-bridge/bridge.sqlite3`. Override it with `--db`, `AGENT_BRIDGE_DB`, or `AGENT_BRIDGE_HOME`.
 
+## Supervised execution
+
+The `run` command is the generic execution entry point. It is independent of
+Hermes and accepts only explicit argv arrays, so no shell wrapper or provider
+specific runner is required. Phases run serially in one worktree; at most one
+phase may have the `writer` role.
+
+Create `execution.json`:
+
+```json
+{
+  "name": "example-pipeline",
+  "cwd": "/path/to/project",
+  "phases": [
+    {
+      "name": "scout",
+      "role": "scout",
+      "command": ["./scripts/scout", "--json"],
+      "timeout": 300
+    },
+    {
+      "name": "implementer",
+      "role": "writer",
+      "command": ["./scripts/implement"],
+      "timeout": 1800
+    },
+    {
+      "name": "reviewer",
+      "role": "reviewer",
+      "command": ["./scripts/review"],
+      "timeout": 600
+    },
+    {
+      "name": "verification",
+      "role": "verification",
+      "command": ["./scripts/verify"],
+      "timeout": 600
+    }
+  ]
+}
+```
+
+Run or resume it:
+
+```bash
+agent-bridge run --manifest execution.json --json
+agent-bridge run --manifest execution.json --resume --json
+agent-bridge execution list --json
+agent-bridge execution show example-pipeline --json
+agent-bridge execution stop example-pipeline --json
+```
+
+Each phase receives `AGENT_BRIDGE_EXECUTION_ID`, `AGENT_BRIDGE_PHASE`,
+`AGENT_BRIDGE_PHASE_ROLE`, `AGENT_BRIDGE_CHECKPOINT`, and the normal bridge
+database/run variables. A phase is `DONE` only when it exits with code zero
+and emits this exact line:
+
+```text
+AGENT_BRIDGE_AGENT_END phase=scout status=success
+```
+
+Exit code zero without that evidence is `PARTIAL`, not success. Non-zero exit
+is `FAILED`; a hard timeout is `TIMEOUT`. Completed phases are recorded in the
+same SQLite database and an atomic JSON checkpoint, so `--resume` skips only
+verified phases and rejects a changed manifest. The supervisor kills the whole
+process group on timeout and never runs phases concurrently. An operator can
+stop the active phase with `execution stop`; it is recorded as `failed` with a
+controlled-stop reason.
+
+The supervisor verifies lifecycle evidence and artifacts generically. Provider
+adapters remain responsible for proving provider-specific facts such as the
+effective model or native subagent metadata; the core never invents those
+claims.
+
 For development without installation:
 
 ```bash

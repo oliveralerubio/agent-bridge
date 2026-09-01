@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .adapters import resolve_preset
 from .bridge import Bridge
 from .lifecycle import TeamLifecycle
@@ -18,6 +19,7 @@ from .protocol import MAX_MESSAGE_CHARS, validate_body
 from .reports import load_report_file
 from .socket_transport import SocketTransportError, UnixSocketTransport
 from .store import Store, utc_now
+from .supervisor import ExecutionSupervisor, load_execution_manifest
 from .teams import load_manifest
 from .tmux import TmuxError, TmuxTransport
 
@@ -628,6 +630,34 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_execution_run(args: argparse.Namespace) -> int:
+    store = _store(args)
+    manifest = load_execution_manifest(Path(args.manifest).expanduser())
+    result = ExecutionSupervisor(store).run(manifest, resume=args.resume)
+    _print(result, args.json)
+    return 0 if result.status == "done" else 1
+
+
+def cmd_execution_list(args: argparse.Namespace) -> int:
+    _print(_store(args).list_executions(args.limit, status=args.status), args.json)
+    return 0
+
+
+def cmd_execution_show(args: argparse.Namespace) -> int:
+    store = _store(args)
+    _print(
+        {"execution": store.get_execution(args.execution), "phases": store.list_execution_phases(args.execution)},
+        args.json,
+    )
+    return 0
+
+
+def cmd_execution_stop(args: argparse.Namespace) -> int:
+    result = ExecutionSupervisor(_store(args)).stop(args.execution)
+    _print(result, args.json)
+    return 0
+
+
 def add_message_args(parser: argparse.ArgumentParser, *, include_from: bool) -> None:
     if include_from:
         parser.add_argument("--from", dest="from_run", help="sender run name or ID; defaults to AGENT_BRIDGE_RUN_ID")
@@ -649,6 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agent-bridge",
         description="Local agent registry, structured inboxes, bounded messaging, and shared tasks",
     )
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--db", default=None, help="SQLite database path")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -910,6 +941,24 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--limit", type=int, default=100)
     audit.set_defaults(func=cmd_audit)
 
+    run = sub.add_parser("run", help="run a durable sequential execution manifest")
+    run.add_argument("--manifest", required=True, help="bounded JSON execution manifest")
+    run.add_argument("--resume", action="store_true", help="resume the matching incomplete execution")
+    run.set_defaults(func=cmd_execution_run)
+
+    execution = sub.add_parser("execution", help="inspect durable sequential executions")
+    execution_sub = execution.add_subparsers(dest="execution_command", required=True)
+    execution_list = execution_sub.add_parser("list", help="list supervised executions")
+    execution_list.add_argument("--limit", type=int, default=50)
+    execution_list.add_argument("--status")
+    execution_list.set_defaults(func=cmd_execution_list)
+    execution_show = execution_sub.add_parser("show", help="show an execution and its phases")
+    execution_show.add_argument("execution")
+    execution_show.set_defaults(func=cmd_execution_show)
+    execution_stop = execution_sub.add_parser("stop", help="stop the active phase of an execution")
+    execution_stop.add_argument("execution")
+    execution_stop.set_defaults(func=cmd_execution_stop)
+
     seen_parsers: set[int] = set()
     for child in sub.choices.values():
         if id(child) in seen_parsers:
@@ -924,7 +973,7 @@ def build_parser() -> argparse.ArgumentParser:
         seen_task_parsers.add(id(child))
         child.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path")
         child.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="emit machine-readable JSON")
-    for group in (team_sub, member_sub, hook_sub, operator_sub):
+    for group in (execution_sub, team_sub, member_sub, hook_sub, operator_sub):
         for child in group.choices.values():
             if id(child) in seen_parsers or id(child) in seen_task_parsers:
                 continue
