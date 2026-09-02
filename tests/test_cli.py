@@ -12,7 +12,7 @@ class CliParserTests(unittest.TestCase):
         with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
             parser.parse_args(["--version"])
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue().strip(), "0.4.0")
+        self.assertEqual(output.getvalue().strip(), "0.5.0")
 
     def test_json_flag_is_supported_after_subcommand(self) -> None:
         args = build_parser().parse_args(["doctor", "--json"])
@@ -52,6 +52,25 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(args.manifest, "execution.json")
         self.assertTrue(args.resume)
         self.assertTrue(args.json)
+
+    def test_completion_and_wait_commands_parse(self) -> None:
+        complete = build_parser().parse_args([
+            "complete", "--from", "worker", "--to", "lead",
+            "--status", "success", "--summary", "checks passed",
+        ])
+        self.assertEqual(complete.from_run, "worker")
+        self.assertEqual(complete.status, "success")
+        wait = build_parser().parse_args([
+            "wait", "--run", "lead", "--from", "worker", "--timeout", "30",
+            "--heartbeat-timeout", "5", "--on-success-command-json", '["next"]',
+            "--fallback-command-json", '["fallback"]', "--json",
+        ])
+        self.assertEqual(wait.target_run, "worker")
+        self.assertEqual(wait.timeout, 30.0)
+        self.assertEqual(wait.fallback_command_json, '["fallback"]')
+        self.assertTrue(wait.json)
+        execution_wait = build_parser().parse_args(["wait", "--run", "lead", "--execution", "exec-1"])
+        self.assertEqual(execution_wait.target_execution, "exec-1")
 
     def test_execution_inspection_commands_are_nested(self) -> None:
         args = build_parser().parse_args(["execution", "show", "exec-1", "--json"])
