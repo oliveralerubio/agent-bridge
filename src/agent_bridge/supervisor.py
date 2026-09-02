@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .bridge import Bridge
 from .store import Store, utc_now
+from .waiter import completion_body
 
 MAX_MANIFEST_BYTES = 128 * 1024
 MAX_PHASES = 32
@@ -53,6 +55,7 @@ class ExecutionManifest:
     phases: tuple[PhaseSpec, ...]
     checkpoint_dir: str | None = None
     metadata: Mapping[str, Any] | None = None
+    notify_to: str | None = None
     max_output: int = MAX_OUTPUT_BYTES
 
     def as_dict(self) -> dict[str, Any]:
@@ -62,6 +65,7 @@ class ExecutionManifest:
             "phases": [phase.as_dict() for phase in self.phases],
             "checkpoint_dir": self.checkpoint_dir,
             "metadata": dict(self.metadata or {}),
+            "notify": {"to": self.notify_to} if self.notify_to else None,
             "max_output": self.max_output,
         }
 
@@ -199,7 +203,7 @@ def load_execution_manifest(source: object) -> ExecutionManifest:
     if not isinstance(data, Mapping):
         raise ValueError("execution manifest must be a JSON object")
 
-    allowed = {"name", "cwd", "phases", "checkpoint_dir", "metadata", "max_output"}
+    allowed = {"name", "cwd", "phases", "checkpoint_dir", "metadata", "notify", "max_output"}
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(f"unknown execution manifest fields: {', '.join(sorted(unknown))}")
@@ -239,13 +243,23 @@ def load_execution_manifest(source: object) -> ExecutionManifest:
     if writer_count > 1:
         raise ValueError("execution manifest may contain only one writer phase")
 
+    notify_to: str | None = None
+    raw_notify = data.get("notify")
+    if raw_notify is not None:
+        if not isinstance(raw_notify, Mapping):
+            raise ValueError("execution notify must be an object")
+        notify_unknown = set(raw_notify) - {"to"}
+        if notify_unknown:
+            raise ValueError(f"unknown execution notify fields: {', '.join(sorted(notify_unknown))}")
+        notify_to = _bounded_text(raw_notify.get("to"), "notification recipient", 128)
+
     checkpoint_dir = data.get("checkpoint_dir")
     if checkpoint_dir is not None:
         checkpoint_dir = _bounded_text(checkpoint_dir, "checkpoint_dir", 4_096)
     max_output = data.get("max_output", MAX_OUTPUT_BYTES)
     if isinstance(max_output, bool) or not isinstance(max_output, int) or not 1 <= max_output <= MAX_OUTPUT_BYTES:
         raise ValueError(f"execution max_output must be between 1 and {MAX_OUTPUT_BYTES}")
-    return ExecutionManifest(name, cwd, tuple(phases), checkpoint_dir, _bounded_metadata(data.get("metadata")), max_output)
+    return ExecutionManifest(name, cwd, tuple(phases), checkpoint_dir, _bounded_metadata(data.get("metadata")), notify_to, max_output)
 
 
 class ExecutionSupervisor:
@@ -393,6 +407,7 @@ class ExecutionSupervisor:
     ) -> tuple[str, int | None, bool, str, str | None]:
         execution = self._get_execution(execution_id)
         manifest_data = json.loads(execution["manifest_json"])
+        notification = manifest_data.get("notify") or {}
         cwd = Path(phase.cwd or manifest_data["cwd"]).expanduser().resolve()
         if not cwd.is_dir():
             return "failed", None, False, "", f"working directory does not exist: {cwd}"
@@ -409,6 +424,7 @@ class ExecutionSupervisor:
                 "AGENT_BRIDGE_PHASE": phase.name,
                 "AGENT_BRIDGE_PHASE_ROLE": phase.role,
                 "AGENT_BRIDGE_CHECKPOINT": checkpoint_path,
+                "AGENT_BRIDGE_NOTIFY_TO": str(notification.get("to", "")),
             }
         )
         self.store.update_run(phase_run_id, status="running", lifecycle_state="running")
@@ -574,6 +590,59 @@ class ExecutionSupervisor:
         self._write_checkpoint(execution, self._get_phases(execution["id"]))
         return self._result(execution["id"])
 
+    def _notify_terminal(
+        self,
+        manifest: ExecutionManifest,
+        execution_id: str,
+        phase_run_id: str,
+        phase_name: str,
+        status: str,
+        error: str | None,
+    ) -> None:
+        if not manifest.notify_to:
+            return
+        completion_status = {"done": "success", "partial": "partial", "failed": "failed", "timeout": "failed"}.get(status, "failed")
+        summary = error or f"execution {manifest.name} finished with status {status}"
+        summary = " ".join(str(summary).split())[:4_096]
+        body = completion_body(
+            run_id=phase_run_id,
+            status=completion_status,
+            summary=summary,
+            execution_id=execution_id,
+            phase=phase_name,
+        )
+        try:
+            recipient = self.store.get_run(manifest.notify_to)
+            message = self.store.create_message(
+                from_run_id=phase_run_id,
+                to_run_id=recipient.id,
+                body=body,
+                idempotency_key=f"{execution_id}-terminal-{status}",
+            )
+        except Exception as exc:  # notification failure must not rewrite work outcome
+            self.store.audit(
+                "execution.notification_failure",
+                phase_run_id,
+                execution_id,
+                {"error": str(exc)[:256], "status": status},
+            )
+            return
+        try:
+            transport = Bridge(self.store).deliver(message)
+            self.store.audit(
+                "execution.notification",
+                phase_run_id,
+                execution_id,
+                {"message_id": message.id, "transport": transport, "status": status},
+            )
+        except Exception as exc:  # notification failure must remain visible to the waiter
+            self.store.audit(
+                "execution.notification_failure",
+                phase_run_id,
+                execution_id,
+                {"message_id": message.id, "error": str(exc)[:256], "status": status},
+            )
+
     def run(self, manifest: ExecutionManifest, *, resume: bool = False) -> ExecutionResult:
         manifest_json = self._manifest_json(manifest)
         digest = hashlib.sha256(manifest_json.encode("utf-8")).hexdigest()
@@ -633,9 +702,15 @@ class ExecutionSupervisor:
             execution = self._get_execution(execution_id)
             self._write_checkpoint(execution, self._get_phases(execution_id))
             if status != "done":
+                self._notify_terminal(manifest, execution_id, phase_run_id, phase.name, status, error)
                 return self._result(execution_id)
 
         self._update_execution(execution_id, status="done", current_phase=None, error=None)
         execution = self._get_execution(execution_id)
         self._write_checkpoint(execution, self._get_phases(execution_id))
+        terminal_phase = self._get_phases(execution_id)[-1]
+        terminal_run_id = terminal_phase["run_id"]
+        if not isinstance(terminal_run_id, str) or not terminal_run_id:
+            raise RuntimeError("completed execution has no terminal phase run")
+        self._notify_terminal(manifest, execution_id, terminal_run_id, terminal_phase["name"], "done", None)
         return self._result(execution_id)

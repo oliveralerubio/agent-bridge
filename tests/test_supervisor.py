@@ -11,6 +11,7 @@ from pathlib import Path
 
 from agent_bridge.store import Store
 from agent_bridge.supervisor import ExecutionSupervisor, load_execution_manifest
+from agent_bridge.waiter import CompletionWaiter
 
 
 class SupervisorContractTests(unittest.TestCase):
@@ -68,6 +69,65 @@ class SupervisorContractTests(unittest.TestCase):
         assert phase_run_id is not None
         self.assertIn(f"run={phase_run_id}", result.phases[0].output)
         self.assertEqual(self.store.get_run(phase_run_id).status, "success")
+
+    def test_terminal_completion_is_notified_to_orchestrator(self) -> None:
+        orchestrator = self.store.create_run(
+            name="orchestrator",
+            agent="hermes",
+            mode="one-shot",
+            command="orchestrator",
+            cwd=str(self.root),
+        )
+        manifest = load_execution_manifest(
+            {
+                "name": "notified-run",
+                "cwd": str(self.root),
+                "notify": {"to": orchestrator.name},
+                "phases": [self.phase("worker", "print('AGENT_BRIDGE_AGENT_END phase=worker status=success')")],
+            }
+        )
+
+        result = ExecutionSupervisor(self.store).run(manifest)
+
+        self.assertEqual(result.status, "done")
+        messages = self.store.list_messages(orchestrator.id)
+        self.assertEqual(len(messages), 1)
+        payload = json.loads(messages[0].body)
+        self.assertEqual(payload["type"], "agent-bridge.completion")
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["run_id"], result.phases[0].run_id)
+        self.assertEqual(messages[0].status, "queued")
+
+    def test_wait_can_match_a_completed_execution_after_message_is_queued(self) -> None:
+        orchestrator = self.store.create_run(
+            name="queued-orchestrator",
+            agent="hermes",
+            mode="one-shot",
+            command="orchestrator",
+            cwd=str(self.root),
+        )
+        manifest = load_execution_manifest(
+            {
+                "name": "queued-notified-run",
+                "cwd": str(self.root),
+                "notify": {"to": orchestrator.name},
+                "phases": [self.phase("worker", "print('AGENT_BRIDGE_AGENT_END phase=worker status=success')")],
+            }
+        )
+        execution = ExecutionSupervisor(self.store).run(manifest)
+
+        waited = CompletionWaiter(self.store).wait(
+            waiter_run_id=orchestrator.id,
+            target_execution_id=execution.id,
+            timeout=5,
+            heartbeat_timeout=0,
+        )
+
+        self.assertEqual(waited.status, "completed")
+        self.assertEqual(waited.target_execution_id, execution.id)
+        self.assertIsNotNone(waited.message_id)
+        assert waited.message_id is not None
+        self.assertEqual(self.store.get_message(waited.message_id).status, "acknowledged")
 
     def test_zero_exit_without_agent_end_is_partial_not_done(self) -> None:
         manifest = self.manifest(self.phase("writer", "print('changed files but no completion proof')", role="writer"))

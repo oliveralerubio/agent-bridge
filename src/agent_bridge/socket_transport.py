@@ -5,6 +5,7 @@ import os
 import socket
 import time
 from pathlib import Path
+from threading import Event
 from typing import Callable
 
 from .protocol import MAX_SOCKET_FRAME_BYTES, encode_socket_payload
@@ -69,6 +70,7 @@ class UnixSocketTransport:
         on_message: Callable[[dict[str, object]], None],
         once: bool = False,
         timeout: float | None = None,
+        stop_event: Event | None = None,
     ) -> None:
         if not path:
             raise SocketTransportError("inbox socket path is empty")
@@ -90,6 +92,8 @@ class UnixSocketTransport:
             else:
                 deadline = None
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:

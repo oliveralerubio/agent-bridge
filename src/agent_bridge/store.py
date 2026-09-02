@@ -224,6 +224,28 @@ CREATE TABLE IF NOT EXISTS execution_phases (
     UNIQUE (execution_id, name)
 );
 
+CREATE TABLE IF NOT EXISTS waits (
+    id TEXT PRIMARY KEY,
+    waiter_run_id TEXT NOT NULL REFERENCES runs(id),
+    target_run_id TEXT REFERENCES runs(id),
+    target_execution_id TEXT REFERENCES executions(id),
+    status TEXT NOT NULL CHECK (status IN ('waiting', 'completed', 'partial', 'failed', 'timeout')),
+    deadline_at TEXT NOT NULL,
+    message_id TEXT REFERENCES messages(id),
+    completion_status TEXT,
+    trigger_status TEXT,
+    trigger_error TEXT,
+    fallback_status TEXT,
+    fallback_error TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_waits_status ON waits(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_waits_target ON waits(target_run_id, status);
+CREATE INDEX IF NOT EXISTS idx_waits_target_execution ON waits(target_execution_id, status);
+
 CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_execution_phases_status ON execution_phases(execution_id, status, phase_index);
 
@@ -308,18 +330,18 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5.0)
+    def connect(self, *, timeout: float = 5.0) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute(f"PRAGMA busy_timeout = {max(0, int(timeout * 1000))}")
         return connection
 
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             self._migrate_legacy(connection)
-            connection.execute("PRAGMA user_version = 5")
+            connection.execute("PRAGMA user_version = 6")
 
     def _migrate_legacy(self, connection: sqlite3.Connection) -> None:
         run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
@@ -358,6 +380,9 @@ class Store:
             connection.execute("DROP TABLE messages_v1")
         elif message_columns and "adapter_accepted_at" not in message_columns:
             connection.execute("ALTER TABLE messages ADD COLUMN adapter_accepted_at TEXT")
+        wait_columns = {row[1] for row in connection.execute("PRAGMA table_info(waits)")}
+        if wait_columns and "target_execution_id" not in wait_columns:
+            connection.execute("ALTER TABLE waits ADD COLUMN target_execution_id TEXT REFERENCES executions(id)")
         task_columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
         task_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone()
         if task_columns and ("requires_approval" not in task_columns or "awaiting_approval" not in (task_sql[0] or "")):
@@ -437,8 +462,8 @@ class Store:
         self.emit_hook("member.created", {"run_id": run_id, "name": name}, actor_run_id=run_id)
         return self.get_run(run_id)
 
-    def get_run(self, reference: str) -> Run:
-        with self.connect() as connection:
+    def get_run(self, reference: str, *, timeout: float | None = None) -> Run:
+        with self.connect(timeout=5.0 if timeout is None else timeout) as connection:
             row = connection.execute("SELECT * FROM runs WHERE id = ? LIMIT 1", (reference,)).fetchone()
             if row is None:
                 row = connection.execute("SELECT * FROM runs WHERE name = ? LIMIT 1", (reference,)).fetchone()
@@ -474,6 +499,80 @@ class Store:
         if status is not None and status not in valid:
             raise ValueError(f"invalid execution status: {status}")
         query = "SELECT * FROM executions"
+        params: list[Any] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_wait(
+        self,
+        *,
+        waiter_run_id: str,
+        target_run_id: str | None,
+        target_execution_id: str | None = None,
+        timeout_seconds: float,
+    ) -> str:
+        if timeout_seconds <= 0 or timeout_seconds > 86_400:
+            raise ValueError("wait timeout must be greater than zero and no more than 24 hours")
+        if target_run_id is not None and target_execution_id is not None:
+            raise ValueError("wait may target a run or an execution, not both")
+        self.get_run(waiter_run_id)
+        if target_run_id is not None:
+            self.get_run(target_run_id)
+        if target_execution_id is not None:
+            self.get_execution(target_execution_id)
+        now = dt.datetime.now(dt.timezone.utc)
+        wait_id = _token("wait")
+        now_text = now.isoformat(timespec="microseconds")
+        deadline = (now + dt.timedelta(seconds=timeout_seconds)).isoformat(timespec="microseconds")
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO waits
+                (id, waiter_run_id, target_run_id, target_execution_id, status, deadline_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?)""",
+                (wait_id, waiter_run_id, target_run_id, target_execution_id, deadline, now_text, now_text),
+            )
+        return wait_id
+
+    def get_wait(self, wait_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM waits WHERE id = ?", (wait_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"wait not found: {wait_id}")
+        return dict(row)
+
+    def update_wait(self, wait_id: str, **fields: Any) -> dict[str, Any]:
+        allowed = {
+            "status", "message_id", "completion_status", "trigger_status", "trigger_error",
+            "fallback_status", "fallback_error", "error",
+        }
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unknown wait fields: {', '.join(sorted(unknown))}")
+        if "status" in fields and fields["status"] not in {"waiting", "completed", "partial", "failed", "timeout"}:
+            raise ValueError("invalid wait status")
+        if not fields:
+            return self.get_wait(wait_id)
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        with self.connect() as connection:
+            updated = connection.execute(
+                f"UPDATE waits SET {assignments}, updated_at = ? WHERE id = ?",
+                (*fields.values(), utc_now(), wait_id),
+            )
+            if updated.rowcount != 1:
+                raise KeyError(f"wait not found: {wait_id}")
+        return self.get_wait(wait_id)
+
+    def list_waits(self, limit: int = 50, *, status: str | None = None) -> list[dict[str, Any]]:
+        valid = {"waiting", "completed", "partial", "failed", "timeout"}
+        if status is not None and status not in valid:
+            raise ValueError(f"invalid wait status: {status}")
+        query = "SELECT * FROM waits"
         params: list[Any] = []
         if status is not None:
             query += " WHERE status = ?"
@@ -678,8 +777,9 @@ class Store:
         self.emit_hook("message.received", {"message_id": message_id, "from_run_id": from_run_id, "to_run_id": to_run_id}, actor_run_id=from_run_id)
         return self.get_message(message_id)
 
-    def get_message(self, message_id: str) -> Message:
-        with self.connect() as connection: row = connection.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+    def get_message(self, message_id: str, *, timeout: float | None = None) -> Message:
+        with self.connect(timeout=5.0 if timeout is None else timeout) as connection:
+            row = connection.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
         if row is None: raise KeyError(f"message not found: {message_id}")
         return Message.from_row(row)
 
@@ -730,15 +830,15 @@ class Store:
         self.audit("message.delivery_failure", message.from_run_id, message_id, {"error": str(error)[:256]})
         return self.get_message(message_id)
 
-    def acknowledge(self, message_id: str, recipient_run_id: str) -> Message:
-        message = self.get_message(message_id)
+    def acknowledge(self, message_id: str, recipient_run_id: str, *, timeout: float | None = None) -> Message:
+        message = self.get_message(message_id, timeout=timeout)
         if message.to_run_id != recipient_run_id: raise ValueError("only the recipient run can acknowledge this message")
         if message.status == "acknowledged": return message
         if message.status != "delivered": raise ValueError("only a delivered message can be acknowledged")
-        with self.connect() as connection: connection.execute("UPDATE messages SET status = 'acknowledged', acknowledged_at = ? WHERE id = ? AND status = 'delivered'", (utc_now(), message_id))
+        with self.connect(timeout=5.0 if timeout is None else timeout) as connection: connection.execute("UPDATE messages SET status = 'acknowledged', acknowledged_at = ? WHERE id = ? AND status = 'delivered'", (utc_now(), message_id))
         self.emit_hook("message.acknowledged", {"message_id": message_id, "run_id": recipient_run_id}, actor_run_id=recipient_run_id)
         self.audit("message.acknowledged", recipient_run_id, message_id, {})
-        return self.get_message(message_id)
+        return self.get_message(message_id, timeout=timeout)
 
     def hold_message(self, message_id: str, recipient_run_id: str) -> Message:
         return self._message_action(message_id, recipient_run_id, "held", {"queued", "failed"})

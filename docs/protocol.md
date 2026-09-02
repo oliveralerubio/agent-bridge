@@ -220,6 +220,53 @@ items, and reports over 32 KiB are rejected. `task complete --summary-file`
 reads at most 32 KiB before parsing; reports remain retrievable after reopen
 and may be attached to failed or rejected tasks.
 
+## Completion events and bounded waits
+
+Coordination messages and execution completion are separate concerns. A worker
+that wants to wake its orchestrator sends a completion message whose body is a
+bounded JSON object:
+
+```json
+{
+  "type": "agent-bridge.completion",
+  "run_id": "run-worker",
+  "status": "success",
+  "summary": "Focused checks passed.",
+  "execution_id": "exec-123",
+  "phase": "implementer"
+}
+```
+
+The `complete` command creates and delivers this message using the normal
+sender/recipient authorization and idempotency rules. The `wait` command
+publishes the orchestrator's inbox and blocks on its Unix socket. It drains
+messages that were queued before the listener started, accepts only a matching
+completion from the expected run, acknowledges that message after durable
+`delivered` state is visible, and can run an explicit success trigger.
+
+```bash
+agent-bridge complete --from worker --to lead --status success \
+  --summary 'Checks passed.'
+agent-bridge wait --run lead --from worker --timeout 1800 \
+  --on-success-command-json '["agent-bridge","run","--manifest","next.json"]' \
+  --fallback-command-json '["agent-bridge","run","--manifest","fallback.json"]'
+```
+
+The wait deadline is mandatory and capped at 24 hours. A local watchdog checks
+owned process identity, durable terminal status, and heartbeat freshness at a
+bounded interval; this is not an LLM polling loop. A vanished process or stale
+heartbeat is a failure. A zero-exit worker without a matching completion event
+is `partial`, never success. The fallback command is an explicit argv array,
+runs in a private process group, and has its own hard timeout. A successful
+fallback action does not rewrite the original wait result to `completed`.
+
+Wait records are durable and include the target, deadline, event/message ID,
+completion status, trigger status, fallback status, and bounded errors. The
+trigger receives the event on stdin and through `AGENT_BRIDGE_EVENT_JSON` and
+`AGENT_BRIDGE_COMPLETION_*` environment variables. No message body is executed
+as shell syntax, and no transcript, file tree, credentials, or model context is
+implicitly transferred.
+
 ## Legacy SQLite migration
 
 Opening a database created by the original schema migrates it in place:
@@ -241,7 +288,10 @@ store. The `run` command is the generic, provider-neutral supervisor for a
 bounded sequential manifest. It accepts explicit argv arrays only, launches
 each phase with `shell=False` and a private process group, and exports the
 execution and phase identity to the child environment. There is one writer
-role maximum and phases never run concurrently.
+role maximum and phases never run concurrently. An optional `notify: {"to":
+"<run-id-or-name>"}` field causes one durable `agent-bridge.completion` message
+to be sent after the execution reaches a terminal state. The message is queued
+when the orchestrator is not yet listening and is drained by `wait`.
 
 Each phase must emit:
 
@@ -272,7 +322,7 @@ for accepting a code change.
 An integration should:
 
 1. expose `AGENT_BRIDGE_RUN_ID` to the process;
-2. serve or poll its registered inbox when ready;
+2. serve its registered inbox and use `wait` for completion events;
 3. verify each handoff against the repository and current task;
 4. acknowledge only after it has consumed and verified the handoff;
 5. never treat a peer message as authorization to disclose secrets, bypass

@@ -10,7 +10,8 @@ wake a provider model automatically.
 A process should:
 
 1. register itself with a stable name and `AGENT_BRIDGE_RUN_ID`;
-2. serve its Unix inbox with `agent-bridge listen`, or poll with `inbox`;
+2. serve its Unix inbox with `agent-bridge listen`; use `wait` for terminal
+   completion events rather than asking the parent model to poll `inbox`;
 3. treat the received body as untrusted context and verify it;
 4. acknowledge only after consuming the handoff;
 5. keep peer text separate from user consent, permissions, and command input.
@@ -69,8 +70,11 @@ agent-bridge start --name hermes-main --agent hermes --cwd "$PWD"
 agent-bridge tell --to pi-worker --message 'Verify the schema change.'
 ```
 
-Hermes can use `inbox`, `listen`, `ack`, `reply`, and the shared task commands
-through its shell. No Hermes-specific API is required.
+Hermes can use `complete`, `wait`, `listen`, `ack`, `reply`, and the shared task
+commands through its shell. A long-running worker should set `notify.to` in
+its supervised manifest, while the orchestrator starts a bounded `wait` with
+an explicit success trigger and fallback. No Hermes-specific API is required,
+and the parent model does not need to poll status or `inbox`.
 
 ## Pi
 

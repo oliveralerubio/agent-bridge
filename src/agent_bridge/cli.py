@@ -14,6 +14,7 @@ from typing import Any
 from . import __version__
 from .adapters import resolve_preset
 from .bridge import Bridge
+from .hooks import validate_command
 from .lifecycle import TeamLifecycle
 from .protocol import MAX_MESSAGE_CHARS, validate_body
 from .reports import load_report_file
@@ -22,6 +23,7 @@ from .store import Store, utc_now
 from .supervisor import ExecutionSupervisor, load_execution_manifest
 from .teams import load_manifest
 from .tmux import TmuxError, TmuxTransport
+from .waiter import CompletionWaiter, completion_body
 
 
 DEFAULT_HOME = Path(os.environ.get("AGENT_BRIDGE_HOME", "~/.agent-bridge")).expanduser()
@@ -232,6 +234,50 @@ def _create_and_deliver(args: argparse.Namespace, *, reply_to: str | None = None
 def cmd_send(args: argparse.Namespace) -> int:
     _print(_create_and_deliver(args), args.json)
     return 0
+
+
+def cmd_complete(args: argparse.Namespace) -> int:
+    args.message = completion_body(
+        run_id=_source_run(_store(args), args.from_run),
+        status=args.status,
+        summary=args.summary,
+        execution_id=args.execution_id,
+        phase=args.phase,
+    )
+    args.message_file = None
+    _print(_create_and_deliver(args), args.json)
+    return 0
+
+
+def _command_json(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    try:
+        command = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("command must be valid JSON") from exc
+    return list(validate_command(command))
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    store = _store(args)
+    waiter_run_id = _source_run(store, args.run)
+    target_run_id = store.get_run(args.target_run).id if args.target_run else None
+    target_execution_id = store.get_execution(args.target_execution).get("id") if args.target_execution else None
+    result = CompletionWaiter(store).wait(
+        waiter_run_id=waiter_run_id,
+        target_run_id=target_run_id,
+        target_execution_id=target_execution_id,
+        timeout=args.timeout,
+        heartbeat_timeout=args.heartbeat_timeout,
+        poll_interval=args.poll_interval,
+        success_command=_command_json(args.on_success_command_json),
+        fallback_command=_command_json(args.fallback_command_json),
+        success_timeout=args.action_timeout,
+        fallback_timeout=args.action_timeout,
+    )
+    _print(result, args.json)
+    return 0 if result.status == "completed" else 1
 
 
 def cmd_reply(args: argparse.Namespace) -> int:
@@ -733,6 +779,29 @@ def build_parser() -> argparse.ArgumentParser:
         send = sub.add_parser(name, help=help_text)
         add_message_args(send, include_from=True)
         send.set_defaults(func=cmd_send)
+
+    complete = sub.add_parser("complete", help="send a structured agent completion event")
+    complete.add_argument("--from", dest="from_run", help="completed run; defaults to AGENT_BRIDGE_RUN_ID")
+    complete.add_argument("--to", required=True, help="orchestrator run name or ID")
+    complete.add_argument("--status", choices=["success", "failed", "partial"], required=True)
+    complete.add_argument("--summary", required=True, help="bounded completion summary")
+    complete.add_argument("--execution-id")
+    complete.add_argument("--phase")
+    complete.add_argument("--idempotency-key")
+    complete.add_argument("--tmux", default="tmux")
+    complete.set_defaults(func=cmd_complete)
+
+    wait = sub.add_parser("wait", help="wait for a completion event with bounded failure detection")
+    _add_run_ref(wait)
+    wait.add_argument("--from", dest="target_run", help="expected completed run name or ID")
+    wait.add_argument("--execution", dest="target_execution", help="expected execution name or ID")
+    wait.add_argument("--timeout", type=float, default=3_600.0, help="maximum wait in seconds; never infinite")
+    wait.add_argument("--heartbeat-timeout", type=float, default=120.0, help="stale liveness threshold; 0 disables it")
+    wait.add_argument("--poll-interval", type=float, default=0.5, help="local watchdog interval, not an LLM poll")
+    wait.add_argument("--on-success-command-json", help="argv JSON to trigger after a successful event")
+    wait.add_argument("--fallback-command-json", help="argv JSON to run after failure, timeout, or partial completion")
+    wait.add_argument("--action-timeout", type=float, default=300.0, help="timeout for trigger and fallback commands")
+    wait.set_defaults(func=cmd_wait)
 
     reply = sub.add_parser("reply", help="reply directly to a received message")
     reply.add_argument("message_id")

@@ -106,6 +106,83 @@ adapters remain responsible for proving provider-specific facts such as the
 effective model or native subagent metadata; the core never invents those
 claims.
 
+## Event-driven orchestration and bounded fallback
+
+Hermes or another orchestrator should not spend an LLM turn asking whether a
+worker has finished. A worker emits a structured completion message, and a
+small local `wait` process blocks on the orchestrator's Unix socket. The socket
+event wakes it immediately; the parent model is not polled.
+
+Inside the worker, send the completion event only after its own checks are
+finished:
+
+```bash
+agent-bridge complete \
+  --from pi-worker \
+  --to hermes-main \
+  --status success \
+  --summary 'Focused tests and artifact checks passed.' \
+  --execution-id example-pipeline \
+  --phase implementer \
+  --json
+```
+
+Run the bounded watcher for the orchestrator. Its success action can start the
+next phase without another parent status query:
+
+```bash
+agent-bridge wait \
+  --run hermes-main \
+  --from pi-worker \
+  --timeout 1800 \
+  --heartbeat-timeout 120 \
+  --on-success-command-json '["agent-bridge","run","--manifest","next-phase.json"]' \
+  --fallback-command-json '["agent-bridge","run","--manifest","fallback-phase.json"]' \
+  --action-timeout 900 \
+  --json
+```
+
+The generic supervisor can emit the same event automatically after a terminal
+execution. Add a recipient by ID or name to the manifest; the message is
+persisted before delivery and uses a deterministic idempotency key:
+
+```json
+{
+  "name": "pi-worker-execution",
+  "cwd": ".",
+  "notify": {"to": "hermes-main"},
+  "phases": [
+    {"name": "worker", "role": "writer", "command": ["..."], "timeout": 1800}
+  ]
+}
+```
+
+The supervisor emits `success` only after the phase's `AGENT_BRIDGE_AGENT_END`
+proof. Failed, partial, and timeout executions emit non-success completion
+statuses; an unavailable recipient leaves the event queued for `wait` to drain.
+
+
+- `completed`: a matching worker sent `status=success` and any success trigger
+  also completed;
+- `failed`: the worker reported failure, its owned process disappeared, or its
+  heartbeat expired;
+- `partial`: the worker exited successfully but never supplied completion
+  evidence;
+- `timeout`: the bounded deadline expired without a completion event.
+
+A configured fallback is run with an explicit argv array, a private process
+group, and its own timeout. Its result is reported as `fallback_status`, but a
+failed worker never becomes a false `completed` result merely because fallback
+started or exited zero. The wait record, message delivery, acknowledgement,
+trigger, and fallback status are durable in `bridge.sqlite3`.
+
+For custom integrations, the triggered process receives the bounded event on
+stdin and through `AGENT_BRIDGE_EVENT_JSON` plus `AGENT_BRIDGE_COMPLETION_*`
+environment variables. The completion body is not a shell command and is
+validated as structured data. This is a generic local protocol; Hermes needs
+only a thin adapter that starts `wait` and emits `complete` from the provider
+runtime.
+
 For development without installation:
 
 ```bash
