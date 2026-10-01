@@ -234,6 +234,17 @@ class SupervisorContractTests(unittest.TestCase):
                 }
             )
 
+    def test_long_running_phase_timeouts_are_accepted(self) -> None:
+        # Real agent runs (e.g. a nightly implementer) need many hours.
+        for hours in (6, 24):
+            manifest = self.manifest(self.phase("long", "pass", timeout=hours * 3_600))
+            self.assertEqual(manifest.phases[0].timeout, hours * 3_600.0)
+
+    def test_phase_timeout_must_stay_positive_finite_and_bounded(self) -> None:
+        for bad in (0, -1, True, "3600", float("inf"), float("nan"), 7 * 24 * 3_600 + 1):
+            with self.subTest(timeout=bad), self.assertRaises(ValueError):
+                self.manifest(self.phase("bad", "pass", timeout=bad))
+
     def test_resume_rejects_changed_manifest(self) -> None:
         original = self.manifest(self.phase("one", "print('AGENT_BRIDGE_AGENT_END phase=one status=success')"))
         first = ExecutionSupervisor(self.store).run(original)

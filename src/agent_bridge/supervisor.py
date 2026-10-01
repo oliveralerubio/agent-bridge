@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import selectors
@@ -18,6 +19,8 @@ from .bridge import Bridge
 from .store import Store, utc_now
 from .waiter import completion_body
 
+# Agent phases (implementers, reviewers) legitimately run for hours; keep a finite safety cap.
+MAX_PHASE_TIMEOUT = 7 * 24 * 3_600.0
 MAX_MANIFEST_BYTES = 128 * 1024
 MAX_PHASES = 32
 MAX_PHASE_NAME = 128
@@ -237,8 +240,13 @@ def load_execution_manifest(source: object) -> ExecutionManifest:
         if phase_cwd is not None:
             phase_cwd = _bounded_text(phase_cwd, "phase cwd", 4_096)
         timeout = raw_phase.get("timeout", 900.0)
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3_600:
-            raise ValueError("execution phase timeout must be between 0 and 3600 seconds")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or not 0 < timeout <= MAX_PHASE_TIMEOUT
+        ):
+            raise ValueError(f"execution phase timeout must be between 0 and {MAX_PHASE_TIMEOUT:.0f} seconds")
         phases.append(PhaseSpec(phase_name, role, command, phase_cwd, float(timeout)))
     if writer_count > 1:
         raise ValueError("execution manifest may contain only one writer phase")
